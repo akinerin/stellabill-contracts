@@ -1,9 +1,10 @@
 use crate::{
     can_transition, compute_next_charge_info, get_allowed_transitions,
     validate_status_transition,
-    ChargeExecutionResult, DataKey, Error, MerchantWithdrawalEvent, OraclePrice,
-    RecoveryReason, Subscription, SubscriptionStatus, SubscriptionVault, SubscriptionVaultClient,
-    MAX_SUBSCRIPTION_ID, MAX_SUBSCRIPTION_LIST_PAGE,
+    ChargeExecutionResult, DISPUTE_WINDOW_SECS, DataKey, Dispute, DisputeOpenedEvent,
+    DisputeRespondedEvent, DisputeResolvedEvent, DisputeStatus, Error, MerchantWithdrawalEvent,
+    OraclePrice, RecoveryReason, Subscription, SubscriptionStatus, SubscriptionVault,
+    SubscriptionVaultClient, MAX_SUBSCRIPTION_ID, MAX_SUBSCRIPTION_LIST_PAGE,
 };
 use soroban_sdk::testutils::{Address as _, Events, Ledger as _};
 use soroban_sdk::{
@@ -5056,6 +5057,10 @@ fn test_oracle_enabled_charge_uses_quote_conversion() {
         &true,
         &Some(oracle_id.clone()),
         &(60 * 24 * 60 * 60),
+        &crate::OracleKind::Spot,
+        &0u64,
+        &0u128,
+        &1u128,
     );
 
     let subscriber = Address::generate(&test_env.env);
@@ -5086,7 +5091,7 @@ fn test_oracle_stale_quote_rejected() {
     let oracle_id = test_env.env.register(MockOracle, ());
     let oracle = MockOracleClient::new(&test_env.env, &oracle_id);
     oracle.set_price(&2_000_000i128, &T0); // stale vs max_age=1
-    test_env.client.set_oracle_config(&test_env.admin, &true, &Some(oracle_id.clone()), &1u64);
+    test_env.client.set_oracle_config(&test_env.admin, &true, &Some(oracle_id.clone()), &1u64, &crate::OracleKind::Spot, &0u64, &0u128, &1u128);
 
     let subscriber = Address::generate(&test_env.env);
     let merchant = Address::generate(&test_env.env);
@@ -5755,7 +5760,7 @@ fn test_admin_authorization_matrix_rejects_non_admin_across_protected_entrypoint
     assert_eq!(
         test_env
             .client
-            .try_set_oracle_config(&stranger, &false, &None::<Address>, &0u64),
+            .try_set_oracle_config(&stranger, &false, &None::<Address>, &0u64, &crate::OracleKind::Spot, &0u64, &0u128, &1u128),
         Err(Ok(Error::Unauthorized))
     );
     assert_eq!(
@@ -5865,7 +5870,7 @@ fn test_admin_authorization_matrix_rejects_stale_admin_after_rotation() {
     assert_eq!(
         test_env
             .client
-            .try_set_oracle_config(&test_env.admin, &false, &None::<Address>, &0u64),
+            .try_set_oracle_config(&test_env.admin, &false, &None::<Address>, &0u64, &crate::OracleKind::Spot, &0u64, &0u128, &1u128),
         Err(Ok(Error::Unauthorized))
     );
     assert_eq!(
@@ -6960,7 +6965,7 @@ fn setup_oracle_env<'a>(
     let oracle_id = env.register(MockOracle, ());
     let oracle = MockOracleClient::new(env, &oracle_id);
     oracle.set_price(&price, &price_ts);
-    client.set_oracle_config(admin, &true, &Some(oracle_id), &max_age_seconds);
+    client.set_oracle_config(admin, &true, &Some(oracle_id), &max_age_seconds, &crate::OracleKind::Spot, &0u64, &0u128, &1u128);
 
     let subscriber = Address::generate(env);
     let merchant = Address::generate(env);
@@ -6986,7 +6991,7 @@ fn test_set_oracle_config_enabled_without_address_fails() {
     let result =
         test_env
             .client
-            .try_set_oracle_config(&test_env.admin, &true, &None::<Address>, &60u64);
+            .try_set_oracle_config(&test_env.admin, &true, &None::<Address>, &60u64, &crate::OracleKind::Spot, &0u64, &0u128, &1u128);
     assert_eq!(result, Err(Ok(Error::OracleNotConfigured)));
 }
 
@@ -6997,7 +7002,7 @@ fn test_set_oracle_config_enabled_with_zero_max_age_fails() {
     let result =
         test_env
             .client
-            .try_set_oracle_config(&test_env.admin, &true, &Some(oracle_id), &0u64);
+            .try_set_oracle_config(&test_env.admin, &true, &Some(oracle_id), &0u64, &crate::OracleKind::Spot, &0u64, &0u128, &1u128);
     assert_eq!(result, Err(Ok(Error::InvalidInput)));
 }
 
@@ -7008,7 +7013,7 @@ fn test_set_oracle_config_disabled_with_zero_max_age_succeeds() {
     let oracle_id = test_env.env.register(MockOracle, ());
     test_env
         .client
-        .set_oracle_config(&test_env.admin, &false, &Some(oracle_id), &0u64);
+        .set_oracle_config(&test_env.admin, &false, &Some(oracle_id), &0u64, &crate::OracleKind::Spot, &0u64, &0u128, &1u128);
     let cfg = test_env.client.get_oracle_config();
     assert!(!cfg.enabled);
 }
@@ -7018,7 +7023,7 @@ fn test_set_oracle_config_disabled_with_no_address_succeeds() {
     let test_env = TestEnv::default();
     test_env
         .client
-        .set_oracle_config(&test_env.admin, &false, &None::<Address>, &0u64);
+        .set_oracle_config(&test_env.admin, &false, &None::<Address>, &0u64, &crate::OracleKind::Spot, &0u64, &0u128, &1u128);
     let cfg = test_env.client.get_oracle_config();
     assert!(!cfg.enabled);
     assert!(cfg.oracle.is_none());
@@ -7139,7 +7144,7 @@ fn test_oracle_price_exactly_at_max_age_boundary_accepted() {
     oracle.set_price(&2_000_000i128, &price_ts);
     test_env
         .client
-        .set_oracle_config(&test_env.admin, &true, &Some(oracle_id), &max_age);
+        .set_oracle_config(&test_env.admin, &true, &Some(oracle_id), &max_age, &crate::OracleKind::Spot, &0u64, &0u128, &1u128);
 
     test_env.env.ledger().set_timestamp(T0);
     let subscriber = Address::generate(&test_env.env);
@@ -7188,7 +7193,7 @@ fn test_oracle_price_one_second_past_max_age_rejected() {
     oracle.set_price(&2_000_000i128, &price_ts);
     test_env
         .client
-        .set_oracle_config(&test_env.admin, &true, &Some(oracle_id), &max_age);
+        .set_oracle_config(&test_env.admin, &true, &Some(oracle_id), &max_age, &crate::OracleKind::Spot, &0u64, &0u128, &1u128);
 
     test_env.env.ledger().set_timestamp(T0);
     let subscriber = Address::generate(&test_env.env);
@@ -7302,12 +7307,13 @@ fn test_get_oracle_config_reflects_set_values() {
     let oracle_id = test_env.env.register(MockOracle, ());
     test_env
         .client
-        .set_oracle_config(&test_env.admin, &true, &Some(oracle_id.clone()), &120u64);
+        .set_oracle_config(&test_env.admin, &true, &Some(oracle_id.clone()), &120u64, &crate::OracleKind::Spot, &0u64, &0u128, &1u128);
 
     let cfg = test_env.client.get_oracle_config();
     assert!(cfg.enabled);
     assert_eq!(cfg.oracle, Some(oracle_id));
     assert_eq!(cfg.max_age_seconds, 120u64);
+    assert_eq!(cfg.kind, crate::OracleKind::Spot);
 }
 
 #[test]
@@ -7317,6 +7323,178 @@ fn test_get_oracle_config_default_is_disabled() {
     assert!(!cfg.enabled);
     assert!(cfg.oracle.is_none());
     assert_eq!(cfg.max_age_seconds, 0u64);
+    assert_eq!(cfg.kind, crate::OracleKind::Spot);
+}
+
+// ── OracleAdapter Tests ───────────────────────────────────────────────────────
+
+#[test]
+fn test_oracle_kind_spot_config_persists() {
+    let test_env = TestEnv::default();
+    let oracle_id = test_env.env.register(MockOracle, ());
+    test_env.client.set_oracle_config(
+        &test_env.admin,
+        &true,
+        &Some(oracle_id.clone()),
+        &3600u64,
+        &crate::OracleKind::Spot,
+        &0u64,
+        &0u128,
+        &1u128,
+    );
+    let cfg = test_env.client.get_oracle_config();
+    assert_eq!(cfg.kind, crate::OracleKind::Spot);
+    assert!(cfg.enabled);
+}
+
+#[test]
+fn test_oracle_kind_twap_config_persists() {
+    let test_env = TestEnv::default();
+    let oracle_id = test_env.env.register(MockOracle, ());
+    test_env.client.set_oracle_config(
+        &test_env.admin,
+        &true,
+        &Some(oracle_id.clone()),
+        &3600u64,
+        &crate::OracleKind::Twap,
+        &600u64, // 10-minute window
+        &0u128,
+        &1u128,
+    );
+    let cfg = test_env.client.get_oracle_config();
+    assert_eq!(cfg.kind, crate::OracleKind::Twap);
+    assert_eq!(cfg.window_secs, 600u64);
+}
+
+#[test]
+fn test_oracle_kind_fixed_rate_config_persists() {
+    let test_env = TestEnv::default();
+    test_env.client.set_oracle_config(
+        &test_env.admin,
+        &true,
+        &None::<Address>,
+        &0u64,
+        &crate::OracleKind::FixedRate,
+        &0u64,
+        &2u128,  // numerator: 2
+        &1u128,  // denominator: 1 → price = 2 * 10^7
+    );
+    let cfg = test_env.client.get_oracle_config();
+    assert_eq!(cfg.kind, crate::OracleKind::FixedRate);
+    assert_eq!(cfg.fixed_numerator, 2u128);
+    assert_eq!(cfg.fixed_denominator, 1u128);
+}
+
+#[test]
+fn test_oracle_fixed_rate_zero_denominator_rejected() {
+    let test_env = TestEnv::default();
+    let result = test_env.client.try_set_oracle_config(
+        &test_env.admin,
+        &true,
+        &None::<Address>,
+        &0u64,
+        &crate::OracleKind::FixedRate,
+        &0u64,
+        &1u128,
+        &0u128, // denominator = 0 → should fail
+    );
+    assert_eq!(result, Err(Ok(Error::InvalidInput)));
+}
+
+#[test]
+fn test_oracle_config_updated_event_contains_kind() {
+    let test_env = TestEnv::default();
+    let oracle_id = test_env.env.register(MockOracle, ());
+    test_env.env.ledger().set_timestamp(T0);
+
+    test_env.client.set_oracle_config(
+        &test_env.admin,
+        &true,
+        &Some(oracle_id.clone()),
+        &3600u64,
+        &crate::OracleKind::Twap,
+        &300u64,
+        &0u128,
+        &1u128,
+    );
+
+    let events = test_env.env.events().all();
+    let mut found = false;
+    for (_, topics, data) in events.iter() {
+        if let Some(first) = topics.get(0) {
+            if soroban_sdk::Symbol::from_val(&test_env.env, &first)
+                == soroban_sdk::Symbol::new(&test_env.env, "oracle_config_updated")
+            {
+                let evt: crate::OracleConfigUpdatedEvent =
+                    soroban_sdk::FromVal::from_val(&test_env.env, &data);
+                assert_eq!(evt.kind, crate::OracleKind::Twap);
+                assert_eq!(evt.window_secs, 300u64);
+                assert!(evt.enabled);
+                found = true;
+            }
+        }
+    }
+    assert!(found, "oracle_config_updated event must be emitted on config change");
+}
+
+#[test]
+fn test_oracle_adapter_dispatch_fixed_rate_non_admin_rejected() {
+    let test_env = TestEnv::default();
+    let stranger = Address::generate(&test_env.env);
+    let result = test_env.client.try_set_oracle_config(
+        &stranger,
+        &true,
+        &None::<Address>,
+        &0u64,
+        &crate::OracleKind::FixedRate,
+        &0u64,
+        &2u128,
+        &1u128,
+    );
+    assert_eq!(result, Err(Ok(Error::Unauthorized)));
+}
+
+#[test]
+fn test_fixed_rate_adapter_quote_logic() {
+    // Unit-test the FixedRateAdapter directly (no contract invocation needed).
+    use crate::oracle_adapter::{FixedRateAdapter, OracleAdapter, PRICE_SCALE};
+    use crate::types::{OracleConfig, OracleKind};
+
+    let env = Env::default();
+    let dummy = Address::generate(&env);
+
+    let config = OracleConfig {
+        enabled: true,
+        oracle: None,
+        max_age_seconds: 0,
+        kind: OracleKind::FixedRate,
+        window_secs: 0,
+        fixed_numerator: 3,
+        fixed_denominator: 2,
+    };
+    // Expected: (3 * 10_000_000) / 2 = 15_000_000
+    let price = FixedRateAdapter::quote(&env, &config, &dummy, &dummy).unwrap();
+    assert_eq!(price, (3 * PRICE_SCALE) / 2);
+}
+
+#[test]
+fn test_fixed_rate_adapter_zero_denominator_errors() {
+    use crate::oracle_adapter::{FixedRateAdapter, OracleAdapter};
+    use crate::types::{Error, OracleConfig, OracleKind};
+
+    let env = Env::default();
+    let dummy = Address::generate(&env);
+    let config = OracleConfig {
+        enabled: true,
+        oracle: None,
+        max_age_seconds: 0,
+        kind: OracleKind::FixedRate,
+        window_secs: 0,
+        fixed_numerator: 1,
+        fixed_denominator: 0, // invalid
+    };
+    let result = FixedRateAdapter::quote(&env, &config, &dummy, &dummy);
+    assert_eq!(result, Err(Error::InvalidInput));
 }
 
 // -- Storage Layout Compatibility Tests ---------------------------------------
@@ -9563,4 +9741,580 @@ fn test_merchant_max_subs_and_plan_max_active_interaction() {
     // Subscriber D subscribes to plan: rejected by MerchantMaxSubs limit.
     let result_d = test_env.client.try_create_subscription_from_plan(&subscriber_d, &plan_id);
     assert_eq!(result_d, Err(Ok(Error::MaxConcurrentSubscriptionsReached)));
+}
+
+// ── Dispute / Chargeback Tests ────────────────────────────────────────────────
+
+const DISPUTE_AMOUNT: i128 = 5_000_000;
+
+/// Seed merchant balance for a subscription's merchant + token, and mint tokens to the contract.
+fn seed_merchant_balance_and_mint(
+    env: &Env,
+    contract_id: &Address,
+    client: &SubscriptionVaultClient,
+    id: u32,
+    amount: i128,
+) {
+    let sub = client.get_subscription(&id);
+    seed_merchant_balance(env, contract_id, &sub.merchant, &sub.token, amount);
+    soroban_sdk::token::StellarAssetClient::new(env, &sub.token).mint(contract_id, &amount);
+}
+
+fn charge_and_seed_merchant(
+    test_env: &TestEnv,
+    id: u32,
+) {
+    let sub = test_env.client.get_subscription(&id);
+    let balance_before = test_env.client.get_merchant_balance_by_token(&sub.merchant, &sub.token);
+    if balance_before < DISPUTE_AMOUNT {
+        let topup = DISPUTE_AMOUNT - balance_before;
+        seed_merchant_balance(
+            &test_env.env,
+            &test_env.client.address,
+            &sub.merchant,
+            &sub.token,
+            DISPUTE_AMOUNT,
+        );
+        soroban_sdk::token::StellarAssetClient::new(&test_env.env, &sub.token)
+            .mint(&test_env.client.address, &topup);
+    }
+}
+
+#[test]
+fn test_open_dispute_basic() {
+    let test_env = TestEnv::default();
+    let (id, subscriber, merchant) =
+        fixtures::create_subscription(&test_env.env, &test_env.client, SubscriptionStatus::Active);
+    charge_and_seed_merchant(&test_env, id);
+
+    let merchant_balance_before =
+        test_env.client.get_merchant_balance_by_token(&merchant, &test_env.token);
+
+    let dispute_id = test_env
+        .client
+        .open_dispute(&subscriber, &id, &DISPUTE_AMOUNT, &None::<soroban_sdk::BytesN<32>>)
+        .unwrap();
+
+    // Merchant balance decreased by disputed amount
+    let merchant_balance_after =
+        test_env.client.get_merchant_balance_by_token(&merchant, &test_env.token);
+    assert_eq!(
+        merchant_balance_after,
+        merchant_balance_before - DISPUTE_AMOUNT
+    );
+
+    // Dispute record is correct
+    let dispute = test_env.client.get_dispute(&dispute_id);
+    assert_eq!(dispute.id, dispute_id);
+    assert_eq!(dispute.subscription_id, id);
+    assert_eq!(dispute.subscriber, subscriber);
+    assert_eq!(dispute.merchant, merchant);
+    assert_eq!(dispute.amount, DISPUTE_AMOUNT);
+    assert_eq!(dispute.status, DisputeStatus::Open);
+    assert_eq!(dispute.evidence_hash, None);
+    assert_eq!(dispute.responded_at, None);
+}
+
+#[test]
+fn test_open_dispute_rejects_double_open() {
+    let test_env = TestEnv::default();
+    let (id, subscriber, _) =
+        fixtures::create_subscription(&test_env.env, &test_env.client, SubscriptionStatus::Active);
+    charge_and_seed_merchant(&test_env, id);
+
+    test_env
+        .client
+        .open_dispute(&subscriber, &id, &DISPUTE_AMOUNT, &None::<soroban_sdk::BytesN<32>>)
+        .unwrap();
+
+    let result = test_env.client.try_open_dispute(
+        &subscriber,
+        &id,
+        &DISPUTE_AMOUNT,
+        &None::<soroban_sdk::BytesN<32>>,
+    );
+    assert_eq!(result, Err(Ok(Error::DisputeAlreadyOpen)));
+}
+
+#[test]
+fn test_open_dispute_rejects_zero_amount() {
+    let test_env = TestEnv::default();
+    let (id, subscriber, _) =
+        fixtures::create_subscription(&test_env.env, &test_env.client, SubscriptionStatus::Active);
+
+    let result = test_env.client.try_open_dispute(
+        &subscriber,
+        &id,
+        &0i128,
+        &None::<soroban_sdk::BytesN<32>>,
+    );
+    assert_eq!(result, Err(Ok(Error::InvalidAmount)));
+}
+
+#[test]
+fn test_open_dispute_rejects_unauthorized_caller() {
+    let test_env = TestEnv::default();
+    let (id, _, _) =
+        fixtures::create_subscription(&test_env.env, &test_env.client, SubscriptionStatus::Active);
+    let stranger = Address::generate(&test_env.env);
+
+    // mock_all_auths allows stranger to pass require_auth, but the
+    // subscriber field check catches the mismatch.
+    let result = test_env.client.try_open_dispute(
+        &stranger,
+        &id,
+        &DISPUTE_AMOUNT,
+        &None::<soroban_sdk::BytesN<32>>,
+    );
+    assert_eq!(result, Err(Ok(Error::Unauthorized)));
+}
+
+#[test]
+fn test_open_dispute_rejects_insufficient_merchant_balance() {
+    let test_env = TestEnv::default();
+    let (id, subscriber, merchant) =
+        fixtures::create_subscription(&test_env.env, &test_env.client, SubscriptionStatus::Active);
+
+    // Merchant has zero balance
+    let mb = test_env.client.get_merchant_balance_by_token(&merchant, &test_env.token);
+    assert_eq!(mb, 0);
+
+    let result = test_env.client.try_open_dispute(
+        &subscriber,
+        &id,
+        &DISPUTE_AMOUNT,
+        &None::<soroban_sdk::BytesN<32>>,
+    );
+    assert_eq!(result, Err(Ok(Error::InsufficientBalance)));
+}
+
+#[test]
+fn test_open_dispute_emits_event() {
+    let test_env = TestEnv::default();
+    let (id, subscriber, merchant) =
+        fixtures::create_subscription(&test_env.env, &test_env.client, SubscriptionStatus::Active);
+    charge_and_seed_merchant(&test_env, id);
+
+    test_env
+        .client
+        .open_dispute(&subscriber, &id, &DISPUTE_AMOUNT, &None::<soroban_sdk::BytesN<32>>)
+        .unwrap();
+
+    let events = test_env.env.events().all();
+    let dispute_event = events
+        .iter()
+        .find(|e| {
+            Symbol::from_val(&test_env.env, &e.1.get(0).unwrap())
+                == Symbol::new(&test_env.env, "dispute_opened")
+        })
+        .expect("missing dispute_opened event");
+
+    assert_eq!(dispute_event.0, test_env.client.address);
+
+    let data: DisputeOpenedEvent = dispute_event.2.clone().into_val(&test_env.env);
+    assert_eq!(data.subscription_id, id);
+    assert_eq!(data.subscriber, subscriber);
+    assert_eq!(data.merchant, merchant);
+    assert_eq!(data.amount, DISPUTE_AMOUNT);
+    assert_eq!(data.evidence_hash, None);
+}
+
+#[test]
+fn test_respond_dispute_basic() {
+    let test_env = TestEnv::default();
+    let (id, subscriber, _) =
+        fixtures::create_subscription(&test_env.env, &test_env.client, SubscriptionStatus::Active);
+    charge_and_seed_merchant(&test_env, id);
+
+    let dispute_id = test_env
+        .client
+        .open_dispute(&subscriber, &id, &DISPUTE_AMOUNT, &None::<soroban_sdk::BytesN<32>>)
+        .unwrap();
+
+    test_env
+        .client
+        .respond_dispute(&test_env.admin, &dispute_id, &None::<soroban_sdk::BytesN<32>>)
+        .unwrap();
+
+    let dispute = test_env.client.get_dispute(&dispute_id);
+    assert_eq!(dispute.status, DisputeStatus::Responded);
+    assert!(dispute.responded_at.is_some());
+}
+
+#[test]
+fn test_respond_dispute_rejects_already_responded() {
+    let test_env = TestEnv::default();
+    let (id, subscriber, _) =
+        fixtures::create_subscription(&test_env.env, &test_env.client, SubscriptionStatus::Active);
+    charge_and_seed_merchant(&test_env, id);
+
+    let dispute_id = test_env
+        .client
+        .open_dispute(&subscriber, &id, &DISPUTE_AMOUNT, &None::<soroban_sdk::BytesN<32>>)
+        .unwrap();
+
+    test_env
+        .client
+        .respond_dispute(&test_env.admin, &dispute_id, &None::<soroban_sdk::BytesN<32>>)
+        .unwrap();
+
+    let result = test_env.client.try_respond_dispute(
+        &test_env.admin,
+        &dispute_id,
+        &None::<soroban_sdk::BytesN<32>>,
+    );
+    assert_eq!(result, Err(Ok(Error::DisputeAlreadyResponded)));
+}
+
+#[test]
+fn test_respond_dispute_rejects_nonexistent() {
+    let test_env = TestEnv::default();
+    let result = test_env.client.try_respond_dispute(
+        &test_env.admin,
+        &999u64,
+        &None::<soroban_sdk::BytesN<32>>,
+    );
+    assert_eq!(result, Err(Ok(Error::DisputeNotFound)));
+}
+
+#[test]
+fn test_respond_dispute_rejects_non_admin() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(SubscriptionVault, ());
+    let client = SubscriptionVaultClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let token = env.register_stellar_asset_contract_v2(admin.clone()).address();
+    client.init(&token, &6, &admin, &1_000_000i128, &(7 * 24 * 60 * 60));
+
+    // Mock auth as a non-admin address
+    let non_admin = Address::generate(&env);
+    env.set_auths(&[non_admin.clone()]);
+    let result = client.try_respond_dispute(&non_admin, &1u64, &None::<soroban_sdk::BytesN<32>>);
+    // The admin check should reject non-admin
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_respond_dispute_emits_event() {
+    let test_env = TestEnv::default();
+    let (id, subscriber, _) =
+        fixtures::create_subscription(&test_env.env, &test_env.client, SubscriptionStatus::Active);
+    charge_and_seed_merchant(&test_env, id);
+
+    let dispute_id = test_env
+        .client
+        .open_dispute(&subscriber, &id, &DISPUTE_AMOUNT, &None::<soroban_sdk::BytesN<32>>)
+        .unwrap();
+
+    test_env
+        .client
+        .respond_dispute(&test_env.admin, &dispute_id, &None::<soroban_sdk::BytesN<32>>)
+        .unwrap();
+
+    let events = test_env.env.events().all();
+    let event = events
+        .iter()
+        .find(|e| {
+            Symbol::from_val(&test_env.env, &e.1.get(0).unwrap())
+                == Symbol::new(&test_env.env, "dispute_responded")
+        })
+        .expect("missing dispute_responded event");
+
+    let data: DisputeRespondedEvent = event.2.clone().into_val(&test_env.env);
+    assert_eq!(data.dispute_id, dispute_id);
+    assert_eq!(data.subscription_id, id);
+}
+
+#[test]
+fn test_resolve_dispute_to_merchant() {
+    let test_env = TestEnv::default();
+    let (id, subscriber, merchant) =
+        fixtures::create_subscription(&test_env.env, &test_env.client, SubscriptionStatus::Active);
+    charge_and_seed_merchant(&test_env, id);
+
+    let merchant_balance_before =
+        test_env.client.get_merchant_balance_by_token(&merchant, &test_env.token);
+
+    let dispute_id = test_env
+        .client
+        .open_dispute(&subscriber, &id, &DISPUTE_AMOUNT, &None::<soroban_sdk::BytesN<32>>)
+        .unwrap();
+
+    // Admin responds then resolves to merchant
+    test_env
+        .client
+        .respond_dispute(&test_env.admin, &dispute_id, &None::<soroban_sdk::BytesN<32>>)
+        .unwrap();
+
+    test_env
+        .client
+        .resolve_dispute(&test_env.admin, &dispute_id, &false) // resolve_to_subscriber = false
+        .unwrap();
+
+    // Merchant balance restored
+    let merchant_balance_after =
+        test_env.client.get_merchant_balance_by_token(&merchant, &test_env.token);
+    assert_eq!(merchant_balance_after, merchant_balance_before);
+
+    // Dispute status updated
+    let dispute = test_env.client.get_dispute(&dispute_id);
+    assert_eq!(dispute.status, DisputeStatus::ResolvedToMerchant);
+}
+
+#[test]
+fn test_resolve_dispute_to_subscriber() {
+    let test_env = TestEnv::default();
+    let (id, subscriber, merchant) =
+        fixtures::create_subscription(&test_env.env, &test_env.client, SubscriptionStatus::Active);
+    charge_and_seed_merchant(&test_env, id);
+
+    let merchant_balance_before =
+        test_env.client.get_merchant_balance_by_token(&merchant, &test_env.token);
+    let subscriber_balance_before =
+        soroban_sdk::token::Client::new(&test_env.env, &test_env.token).balance(&subscriber);
+
+    let dispute_id = test_env
+        .client
+        .open_dispute(&subscriber, &id, &DISPUTE_AMOUNT, &None::<soroban_sdk::BytesN<32>>)
+        .unwrap();
+
+    // Admin responds then resolves to subscriber
+    test_env
+        .client
+        .respond_dispute(&test_env.admin, &dispute_id, &None::<soroban_sdk::BytesN<32>>)
+        .unwrap();
+
+    test_env
+        .client
+        .resolve_dispute(&test_env.admin, &dispute_id, &true) // resolve_to_subscriber = true
+        .unwrap();
+
+    // Merchant balance remains decreased (funds went to subscriber)
+    let merchant_balance_after =
+        test_env.client.get_merchant_balance_by_token(&merchant, &test_env.token);
+    assert_eq!(merchant_balance_after, merchant_balance_before - DISPUTE_AMOUNT);
+
+    // Subscriber received the disputed amount (via transfer from contract)
+    let subscriber_balance_after =
+        soroban_sdk::token::Client::new(&test_env.env, &test_env.token).balance(&subscriber);
+    assert_eq!(
+        subscriber_balance_after,
+        subscriber_balance_before + DISPUTE_AMOUNT
+    );
+
+    let dispute = test_env.client.get_dispute(&dispute_id);
+    assert_eq!(dispute.status, DisputeStatus::ResolvedToSubscriber);
+}
+
+#[test]
+fn test_resolve_dispute_auto_resolve_to_subscriber_after_window_elapsed() {
+    let test_env = TestEnv::default();
+    let (id, subscriber, merchant) =
+        fixtures::create_subscription(&test_env.env, &test_env.client, SubscriptionStatus::Active);
+    charge_and_seed_merchant(&test_env, id);
+
+    let merchant_balance_before =
+        test_env.client.get_merchant_balance_by_token(&merchant, &test_env.token);
+
+    let dispute_id = test_env
+        .client
+        .open_dispute(&subscriber, &id, &DISPUTE_AMOUNT, &None::<soroban_sdk::BytesN<32>>)
+        .unwrap();
+
+    // Advance time past DISPUTE_WINDOW_SECS
+    test_env.env.ledger().set_timestamp(
+        test_env.env.ledger().timestamp() + DISPUTE_WINDOW_SECS + 1,
+    );
+
+    // Resolve without responding — auto-resolve to subscriber
+    test_env
+        .client
+        .resolve_dispute(&test_env.admin, &dispute_id, &false) // ignored for auto-resolve
+        .unwrap();
+
+    let dispute = test_env.client.get_dispute(&dispute_id);
+    assert_eq!(dispute.status, DisputeStatus::ResolvedToSubscriber);
+
+    // Merchant balance reduced (funds went to subscriber)
+    let merchant_balance_after =
+        test_env.client.get_merchant_balance_by_token(&merchant, &test_env.token);
+    assert_eq!(merchant_balance_after, merchant_balance_before - DISPUTE_AMOUNT);
+}
+
+#[test]
+fn test_resolve_dispute_rejects_before_response_and_window() {
+    let test_env = TestEnv::default();
+    let (id, subscriber, _) =
+        fixtures::create_subscription(&test_env.env, &test_env.client, SubscriptionStatus::Active);
+    charge_and_seed_merchant(&test_env, id);
+
+    let dispute_id = test_env
+        .client
+        .open_dispute(&subscriber, &id, &DISPUTE_AMOUNT, &None::<soroban_sdk::BytesN<32>>)
+        .unwrap();
+
+    // Try to resolve immediately without responding — should be rejected
+    let result = test_env.client.try_resolve_dispute(
+        &test_env.admin,
+        &dispute_id,
+        &true,
+    );
+    assert_eq!(result, Err(Ok(Error::DisputeNotResponded)));
+}
+
+#[test]
+fn test_resolve_dispute_rejects_already_resolved() {
+    let test_env = TestEnv::default();
+    let (id, subscriber, _) =
+        fixtures::create_subscription(&test_env.env, &test_env.client, SubscriptionStatus::Active);
+    charge_and_seed_merchant(&test_env, id);
+
+    let dispute_id = test_env
+        .client
+        .open_dispute(&subscriber, &id, &DISPUTE_AMOUNT, &None::<soroban_sdk::BytesN<32>>)
+        .unwrap();
+
+    test_env
+        .client
+        .respond_dispute(&test_env.admin, &dispute_id, &None::<soroban_sdk::BytesN<32>>)
+        .unwrap();
+
+    test_env
+        .client
+        .resolve_dispute(&test_env.admin, &dispute_id, &true)
+        .unwrap();
+
+    // Second resolve should fail
+    let result = test_env.client.try_resolve_dispute(
+        &test_env.admin,
+        &dispute_id,
+        &true,
+    );
+    assert_eq!(result, Err(Ok(Error::DisputeAlreadyResolved)));
+}
+
+#[test]
+fn test_resolve_dispute_rejects_nonexistent() {
+    let test_env = TestEnv::default();
+    let result = test_env.client.try_resolve_dispute(
+        &test_env.admin,
+        &999u64,
+        &true,
+    );
+    assert_eq!(result, Err(Ok(Error::DisputeNotFound)));
+}
+
+#[test]
+fn test_resolve_dispute_emits_event() {
+    let test_env = TestEnv::default();
+    let (id, subscriber, _) =
+        fixtures::create_subscription(&test_env.env, &test_env.client, SubscriptionStatus::Active);
+    charge_and_seed_merchant(&test_env, id);
+
+    let dispute_id = test_env
+        .client
+        .open_dispute(&subscriber, &id, &DISPUTE_AMOUNT, &None::<soroban_sdk::BytesN<32>>)
+        .unwrap();
+
+    test_env
+        .client
+        .respond_dispute(&test_env.admin, &dispute_id, &None::<soroban_sdk::BytesN<32>>)
+        .unwrap();
+
+    test_env
+        .client
+        .resolve_dispute(&test_env.admin, &dispute_id, &true)
+        .unwrap();
+
+    let events = test_env.env.events().all();
+    let event = events
+        .iter()
+        .find(|e| {
+            Symbol::from_val(&test_env.env, &e.1.get(0).unwrap())
+                == Symbol::new(&test_env.env, "dispute_resolved")
+        })
+        .expect("missing dispute_resolved event");
+
+    let data: DisputeResolvedEvent = event.2.clone().into_val(&test_env.env);
+    assert_eq!(data.dispute_id, dispute_id);
+    assert_eq!(data.subscription_id, id);
+    assert_eq!(data.resolution, DisputeStatus::ResolvedToSubscriber);
+}
+
+#[test]
+fn test_get_subscription_dispute_returns_active_dispute() {
+    let test_env = TestEnv::default();
+    let (id, subscriber, _) =
+        fixtures::create_subscription(&test_env.env, &test_env.client, SubscriptionStatus::Active);
+    charge_and_seed_merchant(&test_env, id);
+
+    // No dispute initially
+    assert!(test_env.client.get_subscription_dispute(&id).is_none());
+
+    let dispute_id = test_env
+        .client
+        .open_dispute(&subscriber, &id, &DISPUTE_AMOUNT, &None::<soroban_sdk::BytesN<32>>)
+        .unwrap();
+
+    // Dispute is now tracked
+    assert_eq!(
+        test_env.client.get_subscription_dispute(&id),
+        Some(dispute_id)
+    );
+
+    // After resolution, the tracking is cleared
+    test_env
+        .client
+        .respond_dispute(&test_env.admin, &dispute_id, &None::<soroban_sdk::BytesN<32>>)
+        .unwrap();
+
+    test_env
+        .client
+        .resolve_dispute(&test_env.admin, &dispute_id, &true)
+        .unwrap();
+
+    assert!(test_env.client.get_subscription_dispute(&id).is_none());
+}
+
+#[test]
+fn test_dispute_escrow_accounting_invariant() {
+    let test_env = TestEnv::default();
+    let (id, subscriber, merchant) =
+        fixtures::create_subscription(&test_env.env, &test_env.client, SubscriptionStatus::Active);
+    charge_and_seed_merchant(&test_env, id);
+
+    let initial_merchant_balance =
+        test_env.client.get_merchant_balance_by_token(&merchant, &test_env.token);
+    assert!(initial_merchant_balance >= DISPUTE_AMOUNT);
+
+    let dispute_id = test_env
+        .client
+        .open_dispute(&subscriber, &id, &DISPUTE_AMOUNT, &None::<soroban_sdk::BytesN<32>>)
+        .unwrap();
+
+    // After opening: merchant balance + escrow = initial (invariant holds)
+    let merchant_after_open =
+        test_env.client.get_merchant_balance_by_token(&merchant, &test_env.token);
+
+    // The escrow amount is not directly queryable, but we know merchant balance
+    // decreased by exactly DISPUTE_AMOUNT
+    assert_eq!(
+        merchant_after_open,
+        initial_merchant_balance - DISPUTE_AMOUNT
+    );
+
+    // Resolve to merchant — balance restored
+    test_env
+        .client
+        .respond_dispute(&test_env.admin, &dispute_id, &None::<soroban_sdk::BytesN<32>>)
+        .unwrap();
+    test_env
+        .client
+        .resolve_dispute(&test_env.admin, &dispute_id, &false)
+        .unwrap();
+
+    let merchant_after_resolve =
+        test_env.client.get_merchant_balance_by_token(&merchant, &test_env.token);
+    assert_eq!(merchant_after_resolve, initial_merchant_balance);
 }

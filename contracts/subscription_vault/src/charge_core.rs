@@ -36,11 +36,11 @@ use crate::state_machine::transition_to;
 use crate::subscription::{next_charge_time, write_subscription};
 use crate::statements::append_statement;
 use crate::types::{
-    BillingChargeKind, BillingPeriodSnapshot, ChargeExecutionResult, DataKey, Error,
-    GracePeriodEnteredEvent, LifetimeCapReachedEvent, SubscriptionChargeFailedEvent,
-    SubscriptionChargedEvent, SubscriptionStatus, UsageChargeRejectedEvent, UsageChargeResult,
-    UsageLimits, UsageState, UsageStatementEvent, SNAPSHOT_FLAG_CLOSED,
-    SNAPSHOT_FLAG_INTERVAL_CHARGED, SNAPSHOT_FLAG_USAGE_CHARGED,
+    BillingChargeKind, BillingPeriodSnapshot, ChargeExecutionResult, ChargeFailureEvent, DataKey,
+    Error, GracePeriodEnteredEvent, LifetimeCapReachedEvent, SubscriptionCancelledEvent,
+    SubscriptionChargeFailedEvent, SubscriptionChargedEvent, SubscriptionStatus,
+    UsageChargeRejectedEvent, UsageChargeResult, UsageLimits, UsageState, UsageStatementEvent,
+    SNAPSHOT_FLAG_CLOSED, SNAPSHOT_FLAG_INTERVAL_CHARGED, SNAPSHOT_FLAG_USAGE_CHARGED,
 };
 use soroban_sdk::{symbol_short, Env, String, Symbol};
 
@@ -103,6 +103,18 @@ pub fn charge_one(
     let charge_amount = crate::oracle::resolve_charge_amount(env, subscription_id, &sub)
         .map_err(|e| charge_fail(env, subscription_id, e, 0, now))?;
 
+    // ── Coupon discount (before protocol-fee split) ───────────────────────────
+    // Discount is applied to the oracle-resolved gross amount. The fee split and
+    // merchant credit then operate on `charge_amount` (the post-discount payable).
+    // This preserves: Gross = Discount + Merchant Net + Treasury Fee.
+    let (charge_amount, _discount_amount) = crate::coupon::apply_discount_at_charge(
+        env,
+        subscription_id,
+        now,
+        &sub.token,
+        charge_amount,
+    );
+
     if let Some(cap) = sub.lifetime_cap {
         if sub.lifetime_charged >= cap {
             if sub.status != SubscriptionStatus::Cancelled {
@@ -152,6 +164,7 @@ pub fn charge_one(
                         authorizer: sub.subscriber.clone(),
                         refund_amount,
                         timestamp: now,
+                        schema_version: crate::types::EVENT_SCHEMA_VERSION,
                     },
                 );
             }
@@ -182,7 +195,7 @@ pub fn charge_one(
     if let Some(ref k) = idempotency_key {
         let hashed = crate::idempotency::hash_idem_key(
             env,
-            crate::types::DOMAIN_CHARGE_INTERVAL,
+            crate::nonce::DOMAIN_CHARGE_INTERVAL,
             subscription_id,
             k,
         );
@@ -335,7 +348,7 @@ pub fn charge_one(
             if let Some(k) = idempotency_key {
                 let hashed = crate::idempotency::hash_idem_key(
                     env,
-                    crate::types::DOMAIN_CHARGE_INTERVAL,
+                    crate::nonce::DOMAIN_CHARGE_INTERVAL,
                     subscription_id,
                     &k,
                 );

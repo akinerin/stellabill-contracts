@@ -14,9 +14,10 @@ use crate::types::{
     DataKey, Error, Proposal, ProposalCancelledEvent, ProposalExecutedEvent, ProposalKind,
     ProposalSubmittedEvent, ProposalVotedEvent, EVENT_SCHEMA_VERSION,
 };
-use soroban_sdk::{token, Address, Env, Map, String, Symbol, Vec};
+use soroban_sdk::{Address, Env, Map, String, Symbol, Vec};
 
 /// Governance domain for replay protection.
+#[allow(dead_code)]
 const DOMAIN_GOVERNANCE: u32 = 3;
 
 /// Add or update a guardian's voting weight.
@@ -206,8 +207,8 @@ pub fn do_execute_proposal(env: &Env, proposal_id: u64) -> Result<(), Error> {
         }
         ProposalKind::SetProtocolFee => {
             crate::admin::write_config(env, &DataKey::FeeBps, &proposal.target3);
-            if let Some(treasury) = proposal.target2 {
-                crate::admin::write_config(env, &DataKey::Treasury, &treasury);
+            if let Some(ref treasury) = proposal.target2 {
+                crate::admin::write_config(env, &DataKey::Treasury, treasury);
             }
         }
         ProposalKind::UpgradeContract => {
